@@ -22,6 +22,21 @@ from typing import Any
 
 import anthropic
 
+# Read-only knowledge-vault adapter. Inert unless ADVISOR_VAULT_PATH is set,
+# so this stays a plain generic advisor for anyone who does not use it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vault  # noqa: E402
+
+# Windows consoles default to cp1252, which cannot encode the emoji this
+# advisor is instructed to emit (the confidence tags in its output format)
+# or the box-drawing characters in its banner. Without this, the first such
+# character kills the process with UnicodeEncodeError mid-answer.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, OSError):
+        pass
+
 # ---------------------------------------------------------------------------
 # System prompt — embedded CEO knowledge base (cached on first call)
 # ---------------------------------------------------------------------------
@@ -408,8 +423,16 @@ TOOLS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 
 def _run_tool(name: str, tool_input: dict[str, Any]) -> str:
+    # Vault tools first - they need no sys.path juggling.
+    if name == "search_vault":
+        return vault.search_vault(tool_input.get("query", ""), tool_input.get("limit", 5))
+    if name == "read_vault_note":
+        return vault.read_vault_note(tool_input.get("path", ""))
+
+    # The analyzer scripts live in the ceo-advisor SKILL folder, under
+    # c-level-advisor/skills/ - not directly beside this package.
     script_dir = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "ceo-advisor", "scripts")
+        os.path.join(os.path.dirname(__file__), "..", "skills", "ceo-advisor", "scripts")
     )
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
@@ -423,6 +446,45 @@ def _run_tool(name: str, tool_input: dict[str, Any]) -> str:
         return analyze_financial_scenarios(tool_input["base_case"], tool_input["scenarios"])
 
     return f"Unknown tool: {name}"
+
+
+# ---------------------------------------------------------------------------
+# Request assembly
+# ---------------------------------------------------------------------------
+
+def _system_blocks() -> list[dict[str, Any]]:
+    """
+    System prompt as cacheable blocks.
+
+    Two separate cache breakpoints on purpose: the static advisor prompt is
+    large and never changes, while vault context changes whenever the user
+    edits a note. Splitting them means an edited note invalidates only the
+    smaller second block instead of forcing the whole prompt to be re-cached.
+    """
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    context = vault.core_context()
+    if context:
+        blocks.append(
+            {
+                "type": "text",
+                "text": context,
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+    return blocks
+
+
+def _active_tools() -> list[dict[str, Any]]:
+    """Analyzer tools always; vault tools only when a vault is configured."""
+    if vault.is_enabled():
+        return TOOLS + vault.VAULT_TOOLS
+    return TOOLS
 
 
 # ---------------------------------------------------------------------------
@@ -447,14 +509,8 @@ def _stream_turn(
         model="claude-opus-4-8",
         max_tokens=16000,
         thinking={"type": "adaptive"},
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        tools=TOOLS,
+        system=_system_blocks(),
+        tools=_active_tools(),
         messages=messages,
     ) as stream:
         current_block_type: str | None = None
@@ -543,7 +599,20 @@ def main() -> None:
     messages: list[dict[str, Any]] = []
 
     print(BANNER)
-    print("What would you like to discuss?\n")
+
+    # Say plainly whether the advisor is grounded in the user's own notes or
+    # running on generic knowledge. Silent degradation to generic advice is
+    # the worst outcome here - it looks identical but is far less useful.
+    root = vault.vault_root()
+    if root is None:
+        print("  Vault   : not configured - answers will be generic.")
+        print("            Set ADVISOR_VAULT_PATH to ground advice in your own notes.")
+    else:
+        core = [p for p in os.environ.get("ADVISOR_VAULT_CORE", "").split(",") if p.strip()]
+        print(f"  Vault   : {root}")
+        print(f"            {len(core)} core note(s) preloaded, search + read enabled (read-only)")
+
+    print("\nWhat would you like to discuss?\n")
 
     while True:
         try:
