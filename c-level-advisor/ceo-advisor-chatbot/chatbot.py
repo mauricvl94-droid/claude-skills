@@ -603,13 +603,15 @@ def main() -> None:
     # Say plainly whether the advisor is grounded in the user's own notes or
     # running on generic knowledge. Silent degradation to generic advice is
     # the worst outcome here - it looks identical but is far less useful.
-    root = vault.vault_root()
-    if root is None:
-        print("  Vault   : not configured - answers will be generic.")
+    roots = vault.vault_roots()
+    if not roots:
+        print("  Sources : not configured - answers will be generic.")
         print("            Set ADVISOR_VAULT_PATH to ground advice in your own notes.")
     else:
         core = [p for p in os.environ.get("ADVISOR_VAULT_CORE", "").split(",") if p.strip()]
-        print(f"  Vault   : {root}")
+        for i, (label, path) in enumerate(roots):
+            tag = "  Sources : " if i == 0 else "            "
+            print(f"{tag}{label}  ->  {path}")
         print(f"            {len(core)} core note(s) preloaded, search + read enabled (read-only)")
 
     print("\nWhat would you like to discuss?\n")
