@@ -156,7 +156,8 @@
 
   <div class="sec">
     <h3>Session</h3>
-    <button class="btn" id="reset">Clear conversation</button>
+    <!-- Deliberately not called "clear": it archives, it does not delete. -->
+    <button class="btn" id="reset">Archive &amp; start new</button>
   </div>
 </aside>
 
@@ -208,6 +209,23 @@ Try: <strong>"Dari Active Priorities saya, mana yang paling berisiko kalau dibia
   }).catch(() => { $('grounded').textContent = 'server unreachable'; });
 
   function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+  /* Replay the stored conversation, so closing the app and reopening it
+     continues where you left off instead of starting blank. */
+  fetch('/api/history').then(r => r.json()).then(h => {
+    if (!h.messages || !h.messages.length) return;
+    stream.innerHTML = '';
+    for (const m of h.messages){
+      add(m.role === 'user' ? 'you' : 'ai', m.role === 'user' ? 'YOU' : 'ADVISOR', md(m.text));
+    }
+    const note = document.createElement('div');
+    note.className = 'thinking';
+    note.style.animation = 'none';
+    note.textContent = `${h.messages.length} pesan sebelumnya dipulihkan`
+      + (h.archives && h.archives.length ? ` · ${h.archives.length} arsip tersimpan` : '');
+    stream.appendChild(note);
+    stream.scrollTop = stream.scrollHeight;
+  }).catch(() => {});
 
   /* ---------- tiny markdown ---------- */
   function md(t){
@@ -299,9 +317,12 @@ Try: <strong>"Dari Active Priorities saya, mana yang paling berisiko kalau dibia
     $('langLabel').textContent = langId ? 'Bahasa Indonesia' : 'English';
   };
   $('reset').onclick = () => {
-    fetch('/api/reset', {method:'POST'}).then(() => {
+    fetch('/api/reset', {method:'POST'}).then(r => r.json()).then(d => {
       stream.innerHTML = ''; if (synth) synth.cancel();
-      add('ai','ADVISOR','Conversation cleared. Vault context is still loaded.');
+      // Nothing is deleted - the old conversation is filed away on disk.
+      add('ai','ADVISOR', d.archived
+        ? `Percakapan diarsipkan ke <code>${esc(d.archived)}</code>, tidak dihapus. Konteks vault tetap dimuat.`
+        : 'Belum ada yang perlu diarsipkan. Konteks vault tetap dimuat.');
     });
   };
 

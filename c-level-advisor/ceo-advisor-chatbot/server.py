@@ -37,11 +37,79 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("ADVISOR_HUD_PORT", "8787"))
 HERE = Path(__file__).resolve().parent
 
+# Conversation is written to disk after every turn and reloaded on start.
+# Without this the whole conversation dies with the process - and a process
+# that gets closed by accident is the normal case for a desktop app, not the
+# exception.
+HISTORY_DIR = Path(
+    os.environ.get("ADVISOR_HISTORY_DIR") or (Path.home() / ".ceo-advisor" / "history")
+).expanduser()
+CURRENT = HISTORY_DIR / "current.json"
+
 # Single local user, so one conversation lives in the process. Guarded because
 # ThreadingHTTPServer can overlap requests (a stray double-submit otherwise
 # interleaves two turns into one history and corrupts it).
 _messages: list[dict[str, Any]] = []
 _lock = threading.Lock()
+
+
+def _load_history() -> None:
+    """Restore the previous conversation. A corrupt file must not block start."""
+    if not CURRENT.is_file():
+        return
+    try:
+        data = json.loads(CURRENT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, list):
+        _messages.extend(data)
+
+
+def _save_history() -> None:
+    """
+    Write via a temp file then replace, so a crash mid-write cannot leave a
+    truncated history that would fail to load on the next start.
+    """
+    try:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CURRENT.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_messages, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(CURRENT)
+    except OSError:
+        pass  # losing a save is survivable; crashing the turn is not
+
+
+def _archive_history() -> str | None:
+    """
+    'Clear' moves the conversation aside instead of deleting it. Nothing the
+    user said is ever destroyed by pressing a button in the UI.
+    """
+    if not _messages:
+        return None
+    try:
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        n = 1
+        while True:
+            dest = HISTORY_DIR / f"archive-{n:04d}.json"
+            if not dest.exists():
+                break
+            n += 1
+        dest.write_text(json.dumps(_messages, ensure_ascii=False, indent=1), encoding="utf-8")
+        return dest.name
+    except OSError:
+        return None
+
+
+def _plain(msg: dict[str, Any]) -> str:
+    """Flatten one stored message to display text for the UI."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    out = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            out.append(block.get("text", ""))
+    return "".join(out)
 
 
 def _sse(event: str, data: dict[str, Any]) -> bytes:
@@ -85,7 +153,13 @@ def _turn(client: anthropic.Anthropic, messages: list[dict[str, Any]]) -> Iterat
 
         final = stream.get_final_message()
 
-    messages.append({"role": "assistant", "content": list(final.content)})
+    # Store plain dicts, not SDK objects: the API accepts either, but only
+    # dicts survive a round trip through the history file on disk.
+    messages.append({
+        "role": "assistant",
+        "content": [b.model_dump(exclude_none=True) for b in final.content],
+    })
+    _save_history()
 
     if not tool_calls:
         return
@@ -154,13 +228,30 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if self.path == "/api/history":
+            # Replayed into the UI on load so a restart looks like the same
+            # conversation continuing, not a fresh amnesiac one.
+            with _lock:
+                items = [
+                    {"role": m["role"], "text": _plain(m)}
+                    for m in _messages
+                    if _plain(m).strip()
+                ]
+                archives = sorted(p.name for p in HISTORY_DIR.glob("archive-*.json")) \
+                    if HISTORY_DIR.is_dir() else []
+            self._json(200, {"messages": items, "archives": archives,
+                             "dir": str(HISTORY_DIR)})
+            return
+
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:
         if self.path == "/api/reset":
             with _lock:
+                archived = _archive_history()
                 _messages.clear()
-            self._json(200, {"ok": True})
+                _save_history()
+            self._json(200, {"ok": True, "archived": archived})
             return
 
         if self.path != "/api/chat":
@@ -194,6 +285,7 @@ class Handler(BaseHTTPRequestHandler):
 
         with _lock:
             _messages.append({"role": "user", "content": text})
+            _save_history()
             snapshot = _messages
 
             try:
@@ -208,6 +300,7 @@ class Handler(BaseHTTPRequestHandler):
                     snapshot.pop()
                 if snapshot:
                     snapshot.pop()
+                _save_history()
                 self.wfile.write(_sse("error", {"message": str(exc)}))
             except (BrokenPipeError, ConnectionResetError):
                 return  # browser navigated away mid-stream
@@ -221,12 +314,15 @@ def main() -> None:
             "  PowerShell: $env:ANTHROPIC_API_KEY = 'sk-ant-api03-...'"
         )
 
+    _load_history()
+
     roots = vault.vault_roots()
     url = f"http://{HOST}:{PORT}/"
 
     print()
     print("  CEO ADVISOR - HUD")
     print(f"  {url}")
+    print(f"  history: {len(_messages)} message(s) restored from {CURRENT}")
     if roots:
         for label, path in roots:
             print(f"  source: {label} -> {path}")
@@ -236,7 +332,10 @@ def main() -> None:
     print()
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    # The launcher may prefer to open the UI itself (e.g. a Chromium app
+    # window instead of a browser tab), so let it suppress this.
+    if not os.environ.get("ADVISOR_NO_BROWSER"):
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
