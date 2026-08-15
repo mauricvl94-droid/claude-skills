@@ -62,6 +62,9 @@ def _load_history() -> None:
     except (OSError, json.JSONDecodeError):
         return
     if isinstance(data, list):
+        # Ganti isi, jangan menambah: memanggil ini dua kali (mis. reload)
+        # akan menggandakan seluruh percakapan kalau pakai extend saja.
+        _messages.clear()
         _messages.extend(data)
 
 
